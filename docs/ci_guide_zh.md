@@ -36,6 +36,7 @@ flowchart TB
     B["基础 CI<br/>Ruff / Python 单测"]
     C["构建与 Smoke CI<br/>脚本预检 / 手动 full smoke"]
     D["公共 API 兼容性<br/>Breaking Change 检测与通知"]
+    R["CI Gateway<br/>按 PR base.ref 路由"]
     E["Local CI 调度<br/>解析 SHA / 创建 task ref"]
     F["Local CI 结果接收<br/>状态回写 / 分阶段摘要"]
     G["Backend Status Pages<br/>数据同步 / 静态站点部署"]
@@ -57,7 +58,7 @@ flowchart TB
   A --> B
   A --> C
   A --> D
-  A --> E
+  A --> R --> E
   E --> H
   H --> J --> K --> L --> M --> N --> I
   I --> F
@@ -72,7 +73,8 @@ flowchart TB
 | Delivery CI | `.github/workflows/delivery-ci.yml` | CI 脚本预检、前端测试、性能契约测试、手动容器化 full smoke |
 | Public API Compatibility | `.github/workflows/api-compat.yml` | 比较基准提交与候选提交的稳定 Python API |
 | Public API Breaking Change Notification | `.github/workflows/api-breaking-notify.yml` | 对 Breaking Change 结果进行校验并通知提交者 |
-| Dispatch Local CI via Gitee | `.github/workflows/dispatch-local-ci.yml` | 将 PR、push 或手动任务的精确 SHA 投递到 Gitee |
+| CI Gateway | `.github/workflows/ci-gateway.yml` | 从默认分支读取 PR base.ref，并路由到目标分支自己的 CI |
+| Dispatch Local CI via Gitee | `.github/workflows/dispatch-local-ci.yml` | 将 gateway、push 或手动任务的精确 SHA 投递到 Gitee |
 | Receive Local CI Result | `.github/workflows/receive-local-ci-result.yml` | 等待本地结果、回写 GitHub 状态并刷新 Pages |
 | Backend Status Pages | `.github/workflows/backend-status-pages.yml` | 同步 Gitee 结果、校验数据并部署 GitHub Pages |
 
@@ -80,7 +82,7 @@ flowchart TB
 
 ### 3.1 基础 CI
 
-`.github/workflows/ci.yml` 在指定分支的 push 和 PR 上运行，包含两个主要 Job。
+`.github/workflows/ci.yml` 随所在目标分支在 push 和 PR 上运行，包含两个主要 Job。
 
 `Lint & Style`：
 
@@ -181,7 +183,7 @@ scripts/api_contract/tests/test_check_public_api.py
 `api-compat.yml` 在以下场景执行：
 
 - 所有 PR；
-- push 到 `main`、`develop`、``；
+- 任意分支的 push；
 - 手动触发。
 
 PR 场景比较 base SHA 和 PR head SHA；push 场景比较 push 前后的 SHA。输出包括：
@@ -204,13 +206,15 @@ PR 场景比较 base SHA 和 PR head SHA；push 场景比较 push 前后的 SHA�
 
 ### 4.1 任务投递与触发方式
 
-`.github/workflows/dispatch-local-ci.yml` 支持：
+Local CI 的 PR 入口是默认分支上的 `.github/workflows/ci-gateway.yml`。它监听 `pull_request_target` 的 `opened`、`synchronize`、`reopened` 和 `ready_for_review`，从 GitHub API 重新读取 PR，并以 `base.ref` 作为目标 ref 调度该分支同路径的 gateway。
 
-- push 到 `main`、``；
-- PR 的 `opened`、`synchronize`、`reopened`、`ready_for_review`；
-- 手动指定 source branch、commit SHA 和 FlagGems 模式。
+默认分支 gateway 不 checkout PR，不执行 PR 中的脚本，也不读取 `GITEE_TOKEN`。如果目标 base commit 不包含 `dispatch-local-ci.yml`，该分支被视为尚未启用 Local CI并正常跳过；如果启用标志存在但 gateway、receiver 或 Pages worker 不完整，则路由失败并向准确的 PR head SHA 写入 error 状态。
 
-PR 使用 `pull_request_target`，目的是让可信的基准分支 workflow 可以读取 Gitee 凭据。该 workflow 只获取并转发 PR 的精确提交，不在 GitHub runner 上执行 PR 代码。
+目标分支 gateway 收到 `workflow_dispatch` 后，会再次校验 PR 仍为 open、`base.ref`、head/base SHA、gateway commit 和 contract version 均未变化，然后通过同 commit 的 reusable workflow 调用 `dispatch-local-ci.yml`。只有通过校验的 worker job 会显式取得 `GITEE_TOKEN`。
+
+`.github/workflows/dispatch-local-ci.yml` 自身支持分支 push、手动 source branch/commit/full 模式，以及 gateway 的 `workflow_call`；它不再直接监听 `pull_request_target`。目标分支名不在代码中硬编码，包含 `/` 的合法分支名也按原值路由。
+
+维护时，默认分支的 router-only gateway 与目标分支的完整 gateway 必须保持相同的 `workflow_dispatch.inputs`、contract version 和 PR 路由 job。需要让默认分支也运行 workers 时，应以目标分支完整版本整文件替换 gateway，并在同一个 PR 中加入 dispatcher、receiver、Pages 及相关脚本，不手工拼接公共部分。首次引入这些 workers 的 PR 会因为 base commit 尚无启用 marker 而跳过 Local CI；合并后的后续 PR 自动启用。
 
 ### 4.2 精确 SHA 和任务引用
 
@@ -232,7 +236,7 @@ PR 使用 `pull_request_target`，目的是让可信的基准分支 workflow 可
 
 1. 给原始 GitHub SHA 写入 `pending` 状态；
 2. 将 Gitee task ref 作为状态链接；
-3. 启动 `receive-local-ci-result.yml`，传入 SHA、source branch、task ref、状态 context 和等待参数；
+3. 以 `mode=receive` 调度当前目标分支的 `ci-gateway.yml`，再由 gateway 调用 receiver；
 4. 调度阶段失败时将状态更新为 `error`。
 
 ### 4.4 本地轮询与执行
@@ -388,12 +392,14 @@ runs/ci_push/ci_push_<branch>/<sha>/<run-id>/
 
 `receive-local-ci-result.yml` 使用 `bridge_gitee_to_github_status.py` 按 task ref 和 SHA 轮询结果。默认每 60 秒检查一次，单次 receiver 最长等待 20400 秒；当前 workflow 最多允许 6 次续接。
 
+Receiver 的每次续接都重新调度最初目标分支的 gateway，不再回落到 repository default branch。Gateway 会校验 contract version 和 task ref 与 source branch 的归属关系后再调用 receiver。
+
 结果完成后，receiver：
 
 - 把 overall 状态写回原始 GitHub commit；
 - 在 GitHub Actions 中按 Overall、Frontend smoke、Backend smoke/JIT、FlagGems、Compile-time、Pass profiling 和 IR serialization 展示阶段结果；
 - 给每个阶段提供 Gitee artifacts 链接；
-- 对主分支 push 或手动 full 任务触发 Backend Status Pages 刷新。
+- 对当前目标分支的 push 或手动 full 任务触发 Backend Status Pages 刷新。
 
 ### 4.7 GitHub Pages 状态页面
 
@@ -404,7 +410,7 @@ runs/ci_push/ci_push_<branch>/<sha>/<run-id>/
 1. 最近一次手动 full 算子测试，支持搜索、状态筛选、失败阶段筛选、异常项查看、分页以及 CSV/Excel 下载。
 2. 后端健康状态和性能摘要，包括 smoke、编译时间、Pass profiling 和 IR 序列化。
 
-页面是纯静态站点。Gitee token 只在 GitHub Actions 同步步骤中使用，不会进入浏览器端文件。PR 只校验页面和数据契约，不部署；指定分支 push、手动运行以及对应 Local CI 结果完成后可以触发部署。
+页面是纯静态站点。Gitee token 只在 GitHub Actions 同步步骤中使用，不会进入浏览器端文件。PR 只校验页面和数据契约，不部署；目标分支 push 以及对应 Local CI push/full 结果完成后可以触发部署。
 
 #### 4.7.1 数据契约、数据模式与刷新规则
 
@@ -424,9 +430,9 @@ runs/ci_push/ci_push_<branch>/<sha>/<run-id>/
 - `mixed`：后端状态和性能已从 Gitee 同步，但尚无有效手动 full 结果，逐算子区域继续使用演示数据；
 - `live`：逐算子、后端状态和性能三部分均来自实际 Local CI 结果。
 
-生产同步默认从两类独立结果流取数：手动全量算子结果来自 `runs/ci_full/ci_full_<branch>/`，后端健康和性能来自主分支 push 的 `runs/ci_push/`。PR 结果继续保留在历史目录并用于 PR 判定，但不会覆盖公开页面的主分支性能基线。缺少某类性能文件时页面显示不可用，不会把 mock 数据标记为 live。
+生产同步从当前目标分支的两类独立结果流取数：手动全量算子结果来自 `ci/full/<目标分支>`，后端健康和性能来自 `ci/push/<目标分支>`。PR 结果继续保留在历史目录并用于 PR 判定，但不会覆盖公开页面的目标分支性能基线。缺少某类性能文件时页面显示不可用，不会把 mock 数据标记为 live。
 
-`backend-status-pages.yml` 在 PR 中只执行页面与数据契约校验；指定分支 push、手动触发，或 receiver 收到主分支/full 结果后才同步 Gitee 并部署。同步或契约校验失败时，本次部署失败，上一版成功页面仍保持在线。正式访问地址以仓库 `Settings -> Pages` 和 workflow deployment environment 输出为准，不在文档中硬编码。
+`backend-status-pages.yml` 在 PR 中只执行页面与数据契约校验；目标分支 push，或 receiver 收到该分支 push/full 结果后才同步 Gitee 并部署。同步或契约校验失败时，本次部署失败，上一版成功页面仍保持在线。正式访问地址以仓库 `Settings -> Pages` 和 workflow deployment environment 输出为准，不在文档中硬编码。
 
 当前 manifest 只展示 `sophgo-cmodel`，与已经完成端到端验证的 Sophgo CModel profile 一致；`backend-status` 使用列表型契约，后续后端具备独立有效结果后，可增加 backend 记录和 `display.backend_ids`，无需改变现有页面入口协议。
 
@@ -447,11 +453,11 @@ Secret 不应写入仓库、task ref 或普通日志。
 常用变量包括：
 
 - Gitee 结果仓库：`GITEE_RESULTS_OWNER`、`GITEE_RESULTS_REPO`、`GITEE_RESULTS_REPO_URL`、`GITEE_RESULTS_BRANCH`、`GITEE_RESULTS_WEB_URL`；
-- Local CI 状态：`LOCAL_CI_CONTEXT`、`LOCAL_CI_RECEIVER_REF`、`LOCAL_CI_RECEIVER_WAIT_SECONDS`、`LOCAL_CI_RECEIVER_MAX_ATTEMPTS`；
-- Pages 数据源：`DASHBOARD_SOURCE_BRANCH`、`DASHBOARD_FULL_TEST_SOURCE_BRANCH`、`LOCAL_CI_BACKEND_PROFILE`；
+- Local CI 状态：`LOCAL_CI_CONTEXT`、`LOCAL_CI_RECEIVER_WAIT_SECONDS`、`LOCAL_CI_RECEIVER_MAX_ATTEMPTS`；
+- Pages：`LOCAL_CI_BACKEND_PROFILE`；push/full 数据源由当前 gateway 目标分支自动派生；
 - 构建依赖和后端：LLVM、PPL、Sophgo backend、torch_tpu 和 FlagGems 相关变量。
 
-未配置变量时，workflow 会使用文件中定义的默认值。修改默认分支上的 receiver 或 Pages workflow 后，应确认 `LOCAL_CI_RECEIVER_REF` 指向包含这些 workflow 的分支。
+未配置变量时，workflow 会使用文件中定义的默认值。Receiver continuation 和 Pages refresh 始终使用当前 gateway ref，不需要配置额外的 receiver 分支变量。
 
 ### 5.3 本地 `config.env`
 
@@ -554,19 +560,21 @@ GitHub commit status 没有 warning 状态，因此性能 warning 会映射为 s
 4. 检查容器是否存在、名称是否与 `LOCAL_CI_CONTAINER` 一致。
 5. 查看对应 run 目录和 Gitee `local-ci-results` 中的 `delivery-summary.txt`。
 6. 根据阶段查看 `frontend-smoke.log`、`backend-rebuild.log`、`backend-smoke-jit.log`、`flaggems.log` 或性能报告。
-7. Pages 不更新时，检查 receiver 是否触发 `backend-status-pages.yml`，以及数据契约测试和 Gitee 同步步骤。
+7. Pages 不更新时，检查 receiver 是否以 `mode=pages` 触发当前分支 gateway，以及数据契约测试和 Gitee 同步步骤。
 
 ## 8. 安全性与可靠性
 
 - GitHub 不需要主动连接本地服务器，本地服务器只主动读取 Gitee。
 - PR 代码不在具有 Gitee 写权限的 GitHub dispatch runner 上执行。
+- 默认分支 router 不读取 `GITEE_TOKEN`；只有通过 gateway 校验的目标分支 workers 显式取得该 secret。
+- 包含 secret-consuming workers 的目标分支建议使用 ruleset 或等价分支保护；未启用保护时，拥有仓库写权限的人属于 `GITEE_TOKEN` 的信任边界。
 - 本地容器默认不接收可写 Gitee token；私有 relay 应使用只读容器 token。
 - CI 控制脚本来自固定可信目录，与待测 PR 代码分离。
 - 每次任务 fresh-clone 精确 SHA，并清除旧前端安装和构建产物。
 - task ref、SHA、run ID 和结果目录相互关联，receiver 不接受其他 SHA 的旧结果。
 - API 通知 workflow 会再次校验 artifact schema 和 head SHA，避免过期结果通知当前 PR。
 - Pages 在 GitHub Actions 中读取 token，浏览器只接收静态 JSON/CSV/HTML。
-- receiver 支持长任务续接；并发组会取消同一任务的旧调度或旧接收器。
+- receiver 支持长任务续接；所有 continuation 都停留在最初的 PR 目标分支。
 
 ## 9. 代码索引
 

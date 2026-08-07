@@ -24,7 +24,7 @@ DEFAULT_SOURCE_BRANCH = "ci/push/main"
 DEFAULT_FULL_TEST_SOURCE_BRANCH = "ci/full/main"
 DEFAULT_PROFILE = "sophgo-cmodel"
 DEFAULT_RESULTS_WEB_URL = (
-    "https://gitee.com/race-org/triton-anchor-local-ci-results"
+    "https://gitee.com/likehupochuan/try-result"
 )
 RUN_ID_RE = re.compile(r"^(\d{8}T\d{6}Z)-")
 
